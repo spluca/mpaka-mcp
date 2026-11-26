@@ -31,6 +31,8 @@ SMOKE_WAIT_TIMEOUT_MS = 5_000
 
 
 class SmokeApiHandler(BaseHTTPRequestHandler):
+    max_request_bytes = 16 * 1024
+
     def _send(self, payload: dict) -> None:
         body = json.dumps(payload).encode()
         self.send_response(200)
@@ -39,9 +41,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _execution(self) -> dict:
+    def _execution(self, execution_id: str = "00000000-0000-0000-0000-000000000001") -> dict:
         return {
-            "id": "00000000-0000-0000-0000-000000000001", "status": "completed",
+            "id": execution_id, "status": "completed",
             "language": "python", "timeout_ms": 3000, "memory_mb": 128,
             "vcpu_count": 1, "created_at": "2026-11-24T00:00:00Z",
             "finished_at": "2026-11-24T00:00:01Z", "stdout": "ok\n",
@@ -49,9 +51,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
             "output_truncated": False,
         }
 
-    def _environment(self) -> dict:
+    def _environment(self, environment_id: str = "00000000-0000-0000-0000-000000000002") -> dict:
         return {
-            "id": "00000000-0000-0000-0000-000000000002", "status": "ready",
+            "id": environment_id, "status": "ready",
             "requirements": ["requests==2.32.3"], "artifact_sha256": None,
             "artifact_size_bytes": None, "resolved_digest": None,
             "created_at": "2026-11-24T00:00:00Z", "updated_at": "2026-11-24T00:00:01Z",
@@ -106,9 +108,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
         elif path == "/v1/environments":
             payload = {"items": [self._environment()], "page": 1, "page_size": 25, "total": 1, "has_next": False}
         elif path.startswith("/v1/executions/") and _is_uuid_path(path, "/v1/executions/"):
-            payload = self._execution()
+            payload = self._execution(path.removeprefix("/v1/executions/"))
         elif path.startswith("/v1/environments/") and _is_uuid_path(path, "/v1/environments/"):
-            payload = self._environment()
+            payload = self._environment(path.removeprefix("/v1/environments/"))
         else:
             self.send_error(404, "No smoke fixture for this route")
             return
@@ -119,18 +121,44 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
             self.send_error(401, "Missing smoke authorization")
             return
         if self.path in ("/v1/environments", "/v1/executions"):
-            if not self.headers.get("Idempotency-Key"):
+            if not _valid_idempotency_key(self.headers.get("Idempotency-Key")):
                 self.send_error(400, "Missing idempotency key")
                 return
-            self._send(self._environment() if self.path == "/v1/environments" else self._execution())
+            payload = self._read_json_object()
+            if payload is None:
+                return
+            if self.path == "/v1/environments":
+                if not _valid_environment_request(payload):
+                    self.send_error(400, "Invalid environment request")
+                    return
+                self._send(self._environment())
+            else:
+                if not _valid_execution_request(payload):
+                    self.send_error(400, "Invalid execution request")
+                    return
+                self._send(self._execution())
         elif self.path.startswith("/v1/executions/") and self.path.endswith("/cancel"):
             execution_id = self.path[len("/v1/executions/"):-len("/cancel")].strip("/")
             if not _is_uuid(execution_id):
                 self.send_error(404, "No smoke fixture for this route")
                 return
-            self._send(self._execution())
+            self._send(self._execution(execution_id))
         else:
             self.send_error(404, "No smoke fixture for this route")
+
+    def _read_json_object(self) -> dict | None:
+        content_length = self.headers.get("Content-Length", "")
+        if not content_length.isascii() or not content_length.isdigit():
+            self.send_error(400, "Missing or invalid Content-Length")
+            return None
+        if int(content_length) > self.max_request_bytes:
+            self.send_error(413, "Smoke request body is too large")
+            return None
+        body = self.rfile.read(int(content_length))
+        payload = _decode_json_object(self.headers.get("Content-Type"), body)
+        if payload is None:
+            self.send_error(400, "Expected a JSON object")
+        return payload
 
 
 def _is_uuid(value: str) -> bool:
@@ -143,6 +171,48 @@ def _is_uuid(value: str) -> bool:
 
 def _is_uuid_path(path: str, prefix: str) -> bool:
     return _is_uuid(path.removeprefix(prefix))
+
+
+def _decode_json_object(content_type: str | None, body: bytes) -> dict | None:
+    if content_type is None or content_type.split(";", 1)[0].strip().lower() != "application/json":
+        return None
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _valid_idempotency_key(value: str | None) -> bool:
+    return value is not None and 1 <= len(value) <= 128 and all(0x21 <= ord(char) <= 0x7E for char in value)
+
+
+def _valid_execution_request(payload: dict) -> bool:
+    if payload.get("language") != "python" or not isinstance(payload.get("code"), str) or not payload["code"].strip():
+        return False
+    for field in ("timeout_ms", "memory_mb", "vcpu_count"):
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value <= 0):
+            return False
+    if payload.get("memory_mb") is not None and payload.get("memory_profile") is not None:
+        return False
+    if payload.get("vcpu_count") is not None and payload.get("cpu_profile") is not None:
+        return False
+    for field in ("cpu_profile", "memory_profile"):
+        value = payload.get(field)
+        if value is not None and (not isinstance(value, str) or not value):
+            return False
+    environment_id = payload.get("environment_id")
+    return environment_id is None or isinstance(environment_id, str) and _is_uuid(environment_id)
+
+
+def _valid_environment_request(payload: dict) -> bool:
+    requirements = payload.get("requirements")
+    return (
+        isinstance(requirements, list)
+        and bool(requirements)
+        and all(isinstance(item, str) and bool(item.strip()) for item in requirements)
+    )
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass
