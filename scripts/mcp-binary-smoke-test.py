@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the packaged MCP binary protocol smoke validator."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 SMOKE = ROOT / "scripts" / "mcp-binary-smoke.py"
+SMOKE_MODULE_SPEC = importlib.util.spec_from_file_location("mcp_binary_smoke", SMOKE)
+SMOKE_MODULE = importlib.util.module_from_spec(SMOKE_MODULE_SPEC)
+assert SMOKE_MODULE_SPEC is not None and SMOKE_MODULE_SPEC.loader is not None
+SMOKE_MODULE_SPEC.loader.exec_module(SMOKE_MODULE)
 EXPECTED_TOOLS = [
     "execute_python",
     "get_execution",
@@ -123,6 +128,32 @@ class McpBinarySmokeTests(unittest.TestCase):
         result = self.invoke_smoke("all-api-errors")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("all 13 tool calls", result.stderr.lower())
+
+    def test_fixture_json_decoder_rejects_malformed_body(self) -> None:
+        self.assertIsNone(SMOKE_MODULE._decode_json_object("application/json", b"{"))
+
+    def test_fixture_json_decoder_rejects_wrong_content_type(self) -> None:
+        self.assertIsNone(SMOKE_MODULE._decode_json_object("text/plain", b"{}"))
+
+    def test_execution_fixture_echoes_requested_identifier(self) -> None:
+        execution_id = "00000000-0000-0000-0000-000000000123"
+        handler = object.__new__(SMOKE_MODULE.SmokeApiHandler)
+        self.assertEqual(handler._execution(execution_id)["id"], execution_id)
+
+    def test_environment_fixture_echoes_requested_identifier(self) -> None:
+        environment_id = "00000000-0000-0000-0000-000000000123"
+        handler = object.__new__(SMOKE_MODULE.SmokeApiHandler)
+        self.assertEqual(handler._environment(environment_id)["id"], environment_id)
+
+    def test_fixture_rejects_invalid_execution_create_body(self) -> None:
+        self.assertFalse(SMOKE_MODULE._valid_execution_request({"language": "python", "code": " "}))
+
+    def test_fixture_rejects_invalid_environment_requirements(self) -> None:
+        self.assertFalse(SMOKE_MODULE._valid_environment_request({"requirements": [""]}))
+
+    def test_fixture_rejects_invalid_idempotency_keys(self) -> None:
+        self.assertFalse(SMOKE_MODULE._valid_idempotency_key("line\nbreak"))
+        self.assertFalse(SMOKE_MODULE._valid_idempotency_key("x" * 129))
 
 
 if __name__ == "__main__":
