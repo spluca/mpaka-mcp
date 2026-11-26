@@ -24,6 +24,7 @@ EXPECTED_TOOLS = [
     "wait_environment",
     "get_resource_profiles",
     "get_usage",
+    "get_usage_summary",
     "get_quota",
 ]
 
@@ -43,7 +44,7 @@ names = [
     "execute_python", "get_execution", "cancel_execution", "list_executions",
     "wait_execution", "create_environment", "get_environment",
     "list_environments", "wait_environment", "get_resource_profiles",
-    "get_usage", "get_quota",
+    "get_usage", "get_usage_summary", "get_quota",
 ]
 mode = os.environ.get("MCP_SMOKE_TEST_MODE", "valid")
 if mode == "missing-tool":
@@ -121,7 +122,7 @@ class McpBinarySmokeTests(unittest.TestCase):
     def test_rejects_smoke_with_no_successful_tool_calls(self) -> None:
         result = self.invoke_smoke("all-api-errors")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("all 12 tool calls", result.stderr.lower())
+        self.assertIn("all 13 tool calls", result.stderr.lower())
 
 
 if __name__ == "__main__":

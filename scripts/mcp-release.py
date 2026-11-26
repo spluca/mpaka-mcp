@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import re
+import subprocess
 import tarfile
 import zipfile
 from pathlib import Path
@@ -15,6 +16,8 @@ from pathlib import Path
 
 TARGETS = {
     "x86_64-unknown-linux-gnu": ("tar.gz", "mpaka-mcp"),
+    "aarch64-unknown-linux-gnu": ("tar.gz", "mpaka-mcp"),
+    "x86_64-apple-darwin": ("tar.gz", "mpaka-mcp"),
     "aarch64-apple-darwin": ("tar.gz", "mpaka-mcp"),
     "x86_64-pc-windows-msvc": ("zip", "mpaka-mcp.exe"),
 }
@@ -69,46 +72,57 @@ def package(version: str, target: str, binary: Path, output_dir: Path) -> Path:
     return archive
 
 
-def manifest(version: str, release_dir: Path) -> None:
+def manifest(version: str, release_dir: Path, signing_key: Path) -> None:
     if not VERSION_RE.fullmatch(version):
         raise ValueError("version must use MAJOR.MINOR.PATCH")
-    assets = []
+    artifacts = []
     for target in sorted(TARGETS):
         path = release_dir / asset_name(version, target)
         if not path.is_file():
             raise ValueError(f"missing release asset: {path.name}")
-        assets.append(
+        artifacts.append(
             {
-                "name": path.name,
+                "filename": path.name,
                 "target": target,
-                "size_bytes": path.stat().st_size,
+                "size": path.stat().st_size,
                 "sha256": digest(path),
             }
         )
-    data = {"schema_version": 1, "version": version, "assets": assets}
-    manifest_path = release_dir / "release-manifest.json"
+    data = {"version": f"v{version}", "artifacts": artifacts}
+    manifest_path = release_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    paths = sorted([release_dir / item["name"] for item in assets] + [manifest_path])
+    signature_path = release_dir / "manifest.json.sig"
+    subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", str(signing_key), "-out", str(signature_path), str(manifest_path)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    paths = sorted([release_dir / item["filename"] for item in artifacts] + [manifest_path, signature_path])
     (release_dir / "SHA256SUMS").write_text(
         "".join(f"{digest(path)}  {path.name}\n" for path in paths), encoding="ascii"
     )
 
 
-def verify(version: str, release_dir: Path) -> None:
-    data = json.loads((release_dir / "release-manifest.json").read_text(encoding="utf-8"))
-    if data.get("schema_version") != 1 or data.get("version") != version:
-        raise ValueError("release manifest version or schema does not match")
-    assets = data.get("assets")
-    if not isinstance(assets, list) or {item.get("target") for item in assets} != set(TARGETS):
+def verify(version: str, release_dir: Path, public_key: Path) -> None:
+    manifest_path = release_dir / "manifest.json"
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if data.get("version") != f"v{version}":
+        raise ValueError("release manifest version does not match")
+    artifacts = data.get("artifacts")
+    if (
+        not isinstance(artifacts, list)
+        or len(artifacts) != len(TARGETS)
+        or {item.get("target") for item in artifacts} != set(TARGETS)
+    ):
         raise ValueError("release manifest does not contain exactly the supported targets")
-    for item in assets:
-        path = release_dir / item["name"]
+    for item in artifacts:
+        path = release_dir / item["filename"]
         if path.name != asset_name(version, item["target"]) or not path.is_file():
             raise ValueError("unexpected or missing release asset")
-        if item.get("sha256") != digest(path) or item.get("size_bytes") != path.stat().st_size:
+        if item.get("sha256") != digest(path) or item.get("size") != path.stat().st_size:
             raise ValueError(f"asset integrity check failed: {path.name}")
         member_name = TARGETS[item["target"]][1]
         if path.suffix == ".zip":
@@ -120,8 +134,17 @@ def verify(version: str, release_dir: Path) -> None:
                 members = archive.getmembers()
                 if len(members) != 1 or members[0].name != member_name or not members[0].isreg():
                     raise ValueError(f"unexpected archive contents: {path.name}")
+    signature = release_dir / "manifest.json.sig"
+    result = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-verify", str(public_key), "-signature", str(signature), str(manifest_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ValueError("release manifest signature verification failed")
     sums = (release_dir / "SHA256SUMS").read_text(encoding="ascii").splitlines()
-    expected_names = {item["name"] for item in assets} | {"release-manifest.json"}
+    expected_names = {item["filename"] for item in artifacts} | {"manifest.json", "manifest.json.sig"}
     parsed = {}
     for line in sums:
         checksum, name = line.split("  ", 1)
@@ -141,10 +164,14 @@ def parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--target", required=True)
     package_parser.add_argument("--binary", type=Path, required=True)
     package_parser.add_argument("--output-dir", type=Path, required=True)
-    for name in ("manifest", "verify"):
-        command = commands.add_parser(name)
-        command.add_argument("--version", required=True)
-        command.add_argument("--release-dir", type=Path, required=True)
+    manifest_parser = commands.add_parser("manifest")
+    manifest_parser.add_argument("--version", required=True)
+    manifest_parser.add_argument("--release-dir", type=Path, required=True)
+    manifest_parser.add_argument("--signing-key", type=Path, required=True)
+    verify_parser = commands.add_parser("verify")
+    verify_parser.add_argument("--version", required=True)
+    verify_parser.add_argument("--release-dir", type=Path, required=True)
+    verify_parser.add_argument("--public-key", type=Path, required=True)
     return root
 
 
@@ -154,9 +181,9 @@ def main() -> int:
         if args.command == "package":
             print(package(args.version, args.target, args.binary, args.output_dir))
         elif args.command == "manifest":
-            manifest(args.version, args.release_dir)
+            manifest(args.version, args.release_dir, args.signing_key)
         else:
-            verify(args.version, args.release_dir)
+            verify(args.version, args.release_dir, args.public_key)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, zipfile.BadZipFile, tarfile.TarError) as error:
         parser().error(str(error))
     return 0
