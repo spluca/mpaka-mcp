@@ -27,6 +27,7 @@ EXPECTED_TOOLS = {
     "get_usage_summary",
     "get_quota",
 }
+SMOKE_WAIT_TIMEOUT_MS = 5_000
 
 
 class SmokeApiHandler(BaseHTTPRequestHandler):
@@ -222,11 +223,11 @@ def main() -> int:
         ("get_execution", {"execution_id": "00000000-0000-0000-0000-000000000000"}),
         ("cancel_execution", {"execution_id": "00000000-0000-0000-0000-000000000000"}),
         ("list_executions", {}),
-        ("wait_execution", {"execution_id": "00000000-0000-0000-0000-000000000000", "timeout_ms": 100, "poll_interval_ms": 100}),
+        ("wait_execution", {"execution_id": "00000000-0000-0000-0000-000000000000", "timeout_ms": SMOKE_WAIT_TIMEOUT_MS, "poll_interval_ms": 100}),
         ("create_environment", {"requirements": ["requests==2.32.3"], "idempotency_key": "smoke-environment-1"}),
         ("get_environment", {"environment_id": "00000000-0000-0000-0000-000000000000"}),
         ("list_environments", {}),
-        ("wait_environment", {"environment_id": "00000000-0000-0000-0000-000000000000", "timeout_ms": 100, "poll_interval_ms": 100}),
+        ("wait_environment", {"environment_id": "00000000-0000-0000-0000-000000000000", "timeout_ms": SMOKE_WAIT_TIMEOUT_MS, "poll_interval_ms": 100}),
         ("get_usage", {"limit": 1}),
         ("get_usage_summary", {"group_by": "day"}),
         ("get_resource_profiles", {}),
