@@ -160,6 +160,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Expected a JSON object")
         return payload
 
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
 
 def _is_uuid(value: str) -> bool:
     try:
@@ -213,10 +216,6 @@ def _valid_environment_request(payload: dict) -> bool:
         and bool(requirements)
         and all(isinstance(item, str) and bool(item.strip()) for item in requirements)
     )
-
-    def log_message(self, _format: str, *_args: object) -> None:
-        pass
-
 
 def require_tool_catalog(response: dict) -> None:
     result = response.get("result")
