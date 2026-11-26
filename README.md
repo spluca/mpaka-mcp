@@ -55,12 +55,9 @@ See [docs/tools.md](docs/tools.md) for arguments and behavior.
 
 ## Development
 
-```sh
-cargo fmt --all -- --check
-cargo nextest run
-cargo clippy --all-targets -- -D warnings
-bash scripts/mcp-release-test.sh
-```
+Run the full local CI checks with `make ci`. Individual targets are listed by
+`make help` and include formatting, nextest, Clippy, a release build, the
+12-tool protocol smoke test, and release packaging checks.
 
 The HTTP contract tests use a local mocked API. They do not prove the safety or
 isolation properties of the mPaka execution service.
