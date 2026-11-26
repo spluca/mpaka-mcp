@@ -1,0 +1,29 @@
+[package]
+name = "mpaka-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "mPaka's Model Context Protocol client for the mPaka REST API"
+repository = "https://github.com/spluca/mpaka-mcp"
+readme = "README.md"
+
+[[bin]]
+name = "mpaka-mcp"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "=0.13.5", features = ["json"] }
+rmcp = { version = "=3.11.0", features = ["server", "macros", "transport-io"] }
+schemars = { version = "1", features = ["uuid1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["json"] }
+futures-util = "0.3"

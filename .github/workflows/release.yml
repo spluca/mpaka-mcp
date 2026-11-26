@@ -1,0 +1,131 @@
+name: MCP Release
+
+on:
+  push:
+    tags:
+      - 'mpaka-mcp-v*'
+
+concurrency:
+  group: mpaka-mcp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Install MCP smoke validator
+        run: python -m pip install -r scripts/requirements-mcp-smoke.txt
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - name: Verify tag matches MCP crate version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          MPAKA_MCP_RELEASE_VERSION="${GITHUB_REF_NAME#mpaka-mcp-v}"
+          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "mpaka-mcp"))')"
+          test "$MPAKA_MCP_RELEASE_VERSION" = "$PACKAGE_VERSION"
+          echo "MPAKA_MCP_RELEASE_VERSION=$MPAKA_MCP_RELEASE_VERSION" >> "$GITHUB_ENV"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test MCP crate
+        run: cargo nextest run -p mpaka-mcp
+      - name: Run MCP release packaging tests
+        run: bash scripts/mcp-release-test.sh
+      - name: Run MCP Clippy
+        run: cargo clippy --locked -p mpaka-mcp --all-targets -- -D warnings
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - name: Install MCP smoke validator
+        run: python -m pip install -r scripts/requirements-mcp-smoke.txt
+      - name: Build MCP binary
+        shell: bash
+        run: cargo build --locked --release -p mpaka-mcp --target "${{ matrix.target }}"
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          binary="target/${{ matrix.target }}/release/mpaka-mcp"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary+=".exe"; fi
+          python scripts/mcp-binary-smoke.py "$binary"
+      - name: Package release asset
+        shell: bash
+        env:
+          MPAKA_MCP_RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          version="${MPAKA_MCP_RELEASE_VERSION#mpaka-mcp-v}"
+          binary="target/${{ matrix.target }}/release/mpaka-mcp"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary+=".exe"; fi
+          python scripts/mcp-release.py package --version "$version" --target "${{ matrix.target }}" --binary "$binary" --output-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mpaka-mcp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mpaka-mcp-*
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify checksums
+        shell: bash
+        env:
+          MPAKA_MCP_RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          version="${MPAKA_MCP_RELEASE_VERSION#mpaka-mcp-v}"
+          python scripts/mcp-release.py manifest --version "$version" --release-dir dist
+          python scripts/mcp-release.py verify --version "$version" --release-dir dist
+      - name: Attest release assets
+        if: vars.MPAKA_MCP_RELEASE_ATTESTATIONS == 'true'
+        uses: actions/attest@v4
+        with:
+          subject-path: 'dist/*'
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "mpaka-mcp ${GITHUB_REF_NAME#mpaka-mcp-v}"
