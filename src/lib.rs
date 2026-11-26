@@ -52,8 +52,10 @@ impl fmt::Debug for McpConfig {
 
 impl McpConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let base =
-            env::var("MPAKA_API_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:5300".into());
+        let base = resolve_api_base_url(
+            env::var("MPAKA_API_URL").ok().as_deref(),
+            env::var("MPAKA_API_BASE_URL").ok().as_deref(),
+        );
         let api_base_url = Url::parse(&base).map_err(|_| ConfigError::InvalidApiUrl)?;
         let api_key = env::var("MPAKA_API_KEY")
             .ok()
@@ -101,6 +103,13 @@ impl McpConfig {
             request_timeout,
         })
     }
+}
+
+fn resolve_api_base_url(common: Option<&str>, legacy: Option<&str>) -> String {
+    common
+        .or(legacy)
+        .unwrap_or("https://api.mpaka.dev")
+        .to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +290,42 @@ impl ApiClient {
             .await
             .map_err(ApiError::transport)?;
         decode_usage_response(response).await
+    }
+
+    async fn get_usage_summary(
+        &self,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        group_by: Option<String>,
+    ) -> Result<TenantUsageSummary, ApiError> {
+        let now = Utc::now();
+        let until = until.unwrap_or(now);
+        let since = since.unwrap_or(until - chrono::Duration::days(30));
+        if since >= until
+            || until > now
+            || until - since > chrono::Duration::days(366)
+            || group_by.as_deref().is_some_and(|value| value != "day")
+        {
+            return Err(ApiError::input(
+                "usage period must be ordered, no longer than 366 days, end no later than now, and group_by must be day",
+            ));
+        }
+        let mut endpoint = self.endpoint("/v1/usage/summary");
+        {
+            let mut pairs = endpoint.query_pairs_mut();
+            pairs
+                .append_pair("since", &since.to_rfc3339())
+                .append_pair("until", &until.to_rfc3339());
+            if let Some(group_by) = group_by {
+                pairs.append_pair("group_by", &group_by);
+            }
+        }
+        let response = self
+            .request(self.http.get(endpoint))
+            .send()
+            .await
+            .map_err(ApiError::transport)?;
+        decode_json_response(response, MAX_USAGE_RESPONSE_BYTES).await
     }
 
     async fn get_limits(&self) -> Result<ResourceLimits, ApiError> {
@@ -519,6 +564,30 @@ struct TenantUsage {
     #[serde(default)]
     next_cursor: Option<String>,
     items: Vec<TenantUsageItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+struct TenantUsageSummary {
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    attempt_count: i64,
+    measured_attempt_count: i64,
+    pending_attempt_count: i64,
+    unmeasured_terminal_attempt_count: i64,
+    provisioned_vcpu_ms: i64,
+    provisioned_mib_ms: i64,
+    daily: Vec<TenantUsageDay>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+struct TenantUsageDay {
+    date: String,
+    attempt_count: i64,
+    measured_attempt_count: i64,
+    pending_attempt_count: i64,
+    unmeasured_terminal_attempt_count: i64,
+    provisioned_vcpu_ms: i64,
+    provisioned_mib_ms: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -949,6 +1018,33 @@ mod tests {
         }))
     }
 
+    async fn capture_usage_summary(
+        State(captured): State<CapturedRequest>,
+        headers: HeaderMap,
+        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    ) -> Json<serde_json::Value> {
+        *captured.0.lock().expect("capture lock") = Some((headers, json!({"query": uri.query()})));
+        Json(json!({
+            "since": "2026-11-01T00:00:00Z",
+            "until": "2026-11-24T00:00:00Z",
+            "attempt_count": 3,
+            "measured_attempt_count": 2,
+            "pending_attempt_count": 1,
+            "unmeasured_terminal_attempt_count": 0,
+            "provisioned_vcpu_ms": 3000,
+            "provisioned_mib_ms": 384000,
+            "daily": [{
+                "date": "2026-11-23",
+                "attempt_count": 3,
+                "measured_attempt_count": 2,
+                "pending_attempt_count": 1,
+                "unmeasured_terminal_attempt_count": 0,
+                "provisioned_vcpu_ms": 3000,
+                "provisioned_mib_ms": 384000
+            }]
+        }))
+    }
+
     async fn get_environment_response() -> Json<serde_json::Value> {
         Json(environment_json())
     }
@@ -1002,6 +1098,22 @@ mod tests {
             ),
             Err(ConfigError::InvalidApiUrl)
         ));
+    }
+
+    #[test]
+    fn defaults_to_production_url_and_prefers_common_endpoint_variable() {
+        assert_eq!(resolve_api_base_url(None, None), "https://api.mpaka.dev");
+        assert_eq!(
+            resolve_api_base_url(
+                Some("https://common.example"),
+                Some("https://legacy.example")
+            ),
+            "https://common.example"
+        );
+        assert_eq!(
+            resolve_api_base_url(None, Some("https://legacy.example")),
+            "https://legacy.example"
+        );
     }
 
     #[test]
@@ -1633,6 +1745,7 @@ mod tests {
             "create_environment",
             "get_environment",
             "get_usage",
+            "get_usage_summary",
             "get_resource_profiles",
             "get_quota",
             "list_environments",
@@ -1935,6 +2048,53 @@ mod tests {
         assert_eq!(usage.attempt_count, 1);
         assert_eq!(usage.provisioned_vcpu_ms, 2000);
         assert_eq!(usage.items[0].metering_contract_version, 1);
+    }
+
+    #[tokio::test]
+    async fn retrieves_aggregate_usage_summary_with_daily_rows() {
+        let captured = CapturedRequest::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock API");
+        let address = listener.local_addr().expect("mock API address");
+        let app = Router::new()
+            .route("/v1/usage/summary", get(capture_usage_summary))
+            .with_state(captured.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock API");
+        });
+        let config = McpConfig::new(
+            Url::parse(&format!("http://{address}")).expect("mock API URL"),
+            "tenant-key-for-test".into(),
+            Duration::from_secs(5),
+        )
+        .expect("valid MCP config");
+        let client = ApiClient::new(config).expect("API client");
+        let since = DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = DateTime::parse_from_rfc3339("2026-11-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let summary = client
+            .get_usage_summary(Some(since), Some(until), Some("day".into()))
+            .await
+            .expect("usage summary");
+        task.abort();
+
+        let (headers, request) = captured
+            .0
+            .lock()
+            .expect("capture lock")
+            .take()
+            .expect("captured summary request");
+        assert_eq!(headers["authorization"], "Bearer tenant-key-for-test");
+        assert!(request["query"].as_str().unwrap().contains("group_by=day"));
+        assert_eq!(summary.attempt_count, 3);
+        assert_eq!(summary.pending_attempt_count, 1);
+        assert_eq!(summary.daily.len(), 1);
+        assert_eq!(summary.daily[0].date, "2026-11-23");
     }
 
     #[test]

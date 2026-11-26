@@ -28,6 +28,19 @@ pub struct GetUsageInput {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct GetUsageSummaryInput {
+    /// Inclusive UTC start of the usage period, in RFC 3339 format. Defaults to 30 days before `until`.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Exclusive UTC end of the usage period, in RFC 3339 format. Defaults to now.
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Optional daily grouping. The API currently supports only "day".
+    #[serde(default)]
+    pub group_by: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListExecutionsInput {
     /// One-based page number. The API defaults to 1.
     #[serde(default)]
@@ -433,6 +446,34 @@ impl MpakaMcpServer {
             .await
         {
             Ok(usage) => Ok(tool_success_value(&usage)),
+            Err(error) => Ok(tool_failure(error)),
+        }
+    }
+
+    #[tool(
+        description = "Read aggregate provisioned execution usage and daily totals for the configured tenant. Defaults to the last 30 days; use group_by=day for daily rows. This is usage, not a charge.",
+        output_schema = output_schema_for::<TenantUsageSummary>(),
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_usage_summary(
+        &self,
+        Parameters(input): Parameters<GetUsageSummaryInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let _permit = self.acquire_tool_permit().await?;
+        let since = match parse_usage_timestamp(input.since, "since") {
+            Ok(value) => value,
+            Err(error) => return Ok(tool_failure(error)),
+        };
+        let until = match parse_usage_timestamp(input.until, "until") {
+            Ok(value) => value,
+            Err(error) => return Ok(tool_failure(error)),
+        };
+        match self
+            .client
+            .get_usage_summary(since, until, input.group_by)
+            .await
+        {
+            Ok(summary) => Ok(tool_success_value(&summary)),
             Err(error) => Ok(tool_failure(error)),
         }
     }

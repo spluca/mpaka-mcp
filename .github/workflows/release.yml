@@ -6,7 +6,7 @@ on:
       - 'mpaka-mcp-v*'
 
 concurrency:
-  group: mpaka-mcp-release-${{ github.ref }}
+  group: mpaka-mcp-release
   cancel-in-progress: false
 
 permissions:
@@ -39,6 +39,8 @@ jobs:
         run: cargo nextest run -p mpaka-mcp
       - name: Run MCP release packaging tests
         run: bash scripts/mcp-release-test.sh
+      - name: Check Unix installer syntax
+        run: bash -n install
       - name: Run MCP Clippy
         run: cargo clippy --locked -p mpaka-mcp --all-targets -- -D warnings
 
@@ -50,6 +52,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -96,6 +102,7 @@ jobs:
   publish:
     needs: [validate, build]
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 10
     permissions:
       contents: write
@@ -115,17 +122,108 @@ jobs:
         shell: bash
         env:
           MPAKA_MCP_RELEASE_VERSION: ${{ github.ref_name }}
+          MPAKA_MCP_RELEASE_SIGNING_KEY: ${{ secrets.MPAKA_MCP_RELEASE_SIGNING_KEY }}
         run: |
           set -Eeuo pipefail
           version="${MPAKA_MCP_RELEASE_VERSION#mpaka-mcp-v}"
-          python scripts/mcp-release.py manifest --version "$version" --release-dir dist
-          python scripts/mcp-release.py verify --version "$version" --release-dir dist
+          signing_key="$RUNNER_TEMP/mpaka-mcp-signing-key.pem"
+          trap 'rm -f "$signing_key"' EXIT
+          (umask 077 && printf '%s\n' "$MPAKA_MCP_RELEASE_SIGNING_KEY" > "$signing_key")
+          openssl pkey -in "$signing_key" -pubout -out "$RUNNER_TEMP/mpaka-mcp-public.pem" 2>/dev/null
+          embedded="$(openssl pkey -pubin -in mcp-distribution/release-public.pem -outform DER | sha256sum | cut -d' ' -f1)"
+          derived="$(openssl pkey -pubin -in "$RUNNER_TEMP/mpaka-mcp-public.pem" -outform DER | sha256sum | cut -d' ' -f1)"
+          test "$embedded" = "$derived"
+          python scripts/mcp-release.py manifest --version "$version" --release-dir dist --signing-key "$signing_key"
+          python scripts/mcp-release.py verify --version "$version" --release-dir dist --public-key mcp-distribution/release-public.pem
+          printf '%s\n' "$version" > "$RUNNER_TEMP/mpaka-mcp-version"
+          echo "MPAKA_MCP_RELEASE_VERSION=v$version" >> "$GITHUB_ENV"
+          echo "MPAKA_MCP_RELEASE_DIR=$GITHUB_WORKSPACE/dist" >> "$GITHUB_ENV"
+          echo "MPAKA_MCP_PUBLIC_BASE_URL=https://mcp.mpaka.dev" >> "$GITHUB_ENV"
+      - name: Refuse to move the stable pointer backward
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          current_file="$RUNNER_TEMP/current-latest"
+          status="$(curl --silent --show-error --proto '=https' --proto-redir '=https' --output "$current_file" --write-out '%{http_code}' "$MPAKA_MCP_PUBLIC_BASE_URL/latest")"
+          if [[ "$status" == 404 ]]; then
+            current=''
+          elif [[ "$status" == 200 ]]; then
+            current="$(tr -d '\r\n' < "$current_file")"
+            [[ "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'latest contains an invalid version pointer' >&2; exit 1; }
+          else
+            echo "unexpected HTTP status while reading latest: $status" >&2
+            exit 1
+          fi
+          if [[ -n "$current" ]] && [[ "$(printf '%s\n%s\n' "$MPAKA_MCP_RELEASE_VERSION" "$current" | sort -V | head -n1)" != "$current" ]]; then
+            echo "refusing to move latest backward from $current to $MPAKA_MCP_RELEASE_VERSION" >&2
+            exit 1
+          fi
+      - name: Install Cloudflare Worker dependencies
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install Worker dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@10 --activate
+          pnpm --dir mcp-distribution install --frozen-lockfile
+      - name: Deploy distribution Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.MPAKA_MCP_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.MPAKA_MCP_CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm --dir mcp-distribution exec wrangler deploy
+      - name: Publish immutable Cloudflare R2 release prefix
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.MPAKA_MCP_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.MPAKA_MCP_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -Eeuo pipefail
+          prefix="releases/$MPAKA_MCP_RELEASE_VERSION"
+          existing="$RUNNER_TEMP/existing-manifest.json"
+          if curl --silent --show-error --fail --proto '=https' --proto-redir '=https' "$MPAKA_MCP_PUBLIC_BASE_URL/$prefix/manifest.json" --output "$existing"; then
+            cmp --silent "$MPAKA_MCP_RELEASE_DIR/manifest.json" "$existing" || { echo 'immutable release already exists with different manifest' >&2; exit 1; }
+          else
+            for file in "$MPAKA_MCP_RELEASE_DIR"/*; do
+              name="$(basename "$file")"
+              pnpm --dir mcp-distribution exec wrangler r2 object put "mpaka-mcp-releases/$prefix/$name" --file "$file" --remote --content-type application/octet-stream
+            done
+          fi
+      - name: Verify public release objects before advancing latest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for file in "$MPAKA_MCP_RELEASE_DIR"/*; do
+            name="$(basename "$file")"
+            curl --silent --show-error --fail --proto '=https' --proto-redir '=https' "$MPAKA_MCP_PUBLIC_BASE_URL/releases/$MPAKA_MCP_RELEASE_VERSION/$name" --output "$RUNNER_TEMP/public-$name"
+            cmp --silent "$file" "$RUNNER_TEMP/public-$name"
+          done
+      - name: Advance latest after public verification
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.MPAKA_MCP_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.MPAKA_MCP_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -Eeuo pipefail
+          printf '%s\n' "$MPAKA_MCP_RELEASE_VERSION" > "$RUNNER_TEMP/latest"
+          pnpm --dir mcp-distribution exec wrangler r2 object put mpaka-mcp-releases/latest --file "$RUNNER_TEMP/latest" --remote --content-type 'text/plain; charset=utf-8'
+          test "$(curl --silent --show-error --fail --proto '=https' --proto-redir '=https' "$MPAKA_MCP_PUBLIC_BASE_URL/latest" | tr -d '\r\n')" = "$MPAKA_MCP_RELEASE_VERSION"
+      - name: Publish installers after the verified pointer
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.MPAKA_MCP_CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.MPAKA_MCP_CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -Eeuo pipefail
+          for installer in install install.ps1; do
+            pnpm --dir mcp-distribution exec wrangler r2 object put "mpaka-mcp-releases/$installer" --file "$GITHUB_WORKSPACE/$installer" --remote --content-type 'text/plain; charset=utf-8'
+            curl --silent --show-error --fail --proto '=https' --proto-redir '=https' "$MPAKA_MCP_PUBLIC_BASE_URL/$installer" --output "$RUNNER_TEMP/public-$installer"
+            cmp --silent "$GITHUB_WORKSPACE/$installer" "$RUNNER_TEMP/public-$installer"
+          done
       - name: Attest release assets
         if: vars.MPAKA_MCP_RELEASE_ATTESTATIONS == 'true'
         uses: actions/attest@v4
         with:
           subject-path: 'dist/*'
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release mirror
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "mpaka-mcp ${GITHUB_REF_NAME#mpaka-mcp-v}"
+        run: gh release create "${GITHUB_REF_NAME}" dist/* install install.ps1 --verify-tag --generate-notes --title "mpaka-mcp ${GITHUB_REF_NAME#mpaka-mcp-v}"

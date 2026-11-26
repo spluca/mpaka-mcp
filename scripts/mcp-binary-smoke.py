@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
 from threading import Thread
+import uuid
 
 from jsonschema import validators
 
@@ -23,6 +24,7 @@ EXPECTED_TOOLS = {
     "wait_environment",
     "get_resource_profiles",
     "get_usage",
+    "get_usage_summary",
     "get_quota",
 }
 
@@ -55,6 +57,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
         }
 
     def do_GET(self) -> None:
+        if self.headers.get("Authorization") != "Bearer release-smoke-placeholder":
+            self.send_error(401, "Missing smoke authorization")
+            return
         path = self.path.split("?", 1)[0]
         if path == "/v1/limits":
             payload = {
@@ -81,14 +86,27 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
                 "provisioned_vcpu_ms": 1000, "provisioned_mib_ms": 128000,
                 "has_more": False, "next_cursor": None, "items": [],
             }
+        elif path == "/v1/usage/summary":
+            payload = {
+                "since": "2026-11-01T00:00:00Z", "until": "2026-11-24T00:00:00Z",
+                "attempt_count": 1, "measured_attempt_count": 1,
+                "pending_attempt_count": 0, "unmeasured_terminal_attempt_count": 0,
+                "provisioned_vcpu_ms": 1000, "provisioned_mib_ms": 128000,
+                "daily": [{
+                    "date": "2026-11-23", "attempt_count": 1,
+                    "measured_attempt_count": 1, "pending_attempt_count": 0,
+                    "unmeasured_terminal_attempt_count": 0,
+                    "provisioned_vcpu_ms": 1000, "provisioned_mib_ms": 128000,
+                }],
+            }
         elif path == "/v1/executions":
             execution = self._execution()
             payload = {"items": [{key: execution[key] for key in ("id", "status", "language", "created_at", "finished_at")}], "page": 1, "page_size": 25, "total": 1, "has_next": False}
         elif path == "/v1/environments":
             payload = {"items": [self._environment()], "page": 1, "page_size": 25, "total": 1, "has_next": False}
-        elif path.startswith("/v1/executions/"):
+        elif path.startswith("/v1/executions/") and _is_uuid_path(path, "/v1/executions/"):
             payload = self._execution()
-        elif path.startswith("/v1/environments/"):
+        elif path.startswith("/v1/environments/") and _is_uuid_path(path, "/v1/environments/"):
             payload = self._environment()
         else:
             self.send_error(404, "No smoke fixture for this route")
@@ -96,7 +114,34 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
         self._send(payload)
 
     def do_POST(self) -> None:
-        self._send(self._environment() if self.path == "/v1/environments" else self._execution())
+        if self.headers.get("Authorization") != "Bearer release-smoke-placeholder":
+            self.send_error(401, "Missing smoke authorization")
+            return
+        if self.path in ("/v1/environments", "/v1/executions"):
+            if not self.headers.get("Idempotency-Key"):
+                self.send_error(400, "Missing idempotency key")
+                return
+            self._send(self._environment() if self.path == "/v1/environments" else self._execution())
+        elif self.path.startswith("/v1/executions/") and self.path.endswith("/cancel"):
+            execution_id = self.path[len("/v1/executions/"):-len("/cancel")].strip("/")
+            if not _is_uuid(execution_id):
+                self.send_error(404, "No smoke fixture for this route")
+                return
+            self._send(self._execution())
+        else:
+            self.send_error(404, "No smoke fixture for this route")
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_uuid_path(path: str, prefix: str) -> bool:
+    return _is_uuid(path.removeprefix(prefix))
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass
@@ -183,6 +228,7 @@ def main() -> int:
         ("list_environments", {}),
         ("wait_environment", {"environment_id": "00000000-0000-0000-0000-000000000000", "timeout_ms": 100, "poll_interval_ms": 100}),
         ("get_usage", {"limit": 1}),
+        ("get_usage_summary", {"group_by": "day"}),
         ("get_resource_profiles", {}),
         ("get_quota", {}),
     ]
