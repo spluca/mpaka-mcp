@@ -1,5 +1,7 @@
 # mpaka-mcp
 
+[![CI](https://github.com/spluca/mpaka-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/spluca/mpaka-mcp/actions/workflows/ci.yml)
+
 `mpaka-mcp` is a local stdio [Model Context Protocol](https://modelcontextprotocol.io/)
 server that forwards tool requests to the mPaka REST API. It does not execute
 submitted code on the MCP host; execution behavior is provided by the API.
