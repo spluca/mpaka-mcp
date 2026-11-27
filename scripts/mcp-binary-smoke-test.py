@@ -73,9 +73,18 @@ responses = [
 ]
 for request in requests:
     if request.get("method") == "tools/call":
-        name = request.get("params", {}).get("name")
+        params = request.get("params", {})
+        name = params.get("name")
+        arguments = params.get("arguments", {})
         content = {"valid": 42 if mode == "invalid-tool-result" else "yes"} if name == "get_resource_profiles" else {}
-        result = {"isError": True, "content": [{"type": "text", "text": "upstream unavailable"}]} if mode == "all-api-errors" else {"structuredContent": content}
+        if mode == "all-api-errors":
+            result = {"isError": True, "content": [{"type": "text", "text": "upstream unavailable"}]}
+        elif arguments.get("idempotency_key") == "smoke-invalid-requirements":
+            result = {"isError": True, "content": [{"type": "text", "text": json.dumps({"code": "invalid_requirements", "message": "pin each package"})}]}
+        elif arguments.get("environment_id") == "00000000-0000-0000-0000-000000000099":
+            result = {"isError": True, "content": [{"type": "text", "text": json.dumps({"code": "environment_not_found", "message": "not found"})}]}
+        else:
+            result = {"structuredContent": content}
         responses.append({"jsonrpc": "2.0", "id": request["id"], "result": result})
 for response in responses:
     print(json.dumps(response))
@@ -128,6 +137,27 @@ class McpBinarySmokeTests(unittest.TestCase):
         result = self.invoke_smoke("all-api-errors")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("all 13 tool calls", result.stderr.lower())
+
+    def test_accepts_expected_structured_api_error_code(self) -> None:
+        response = {
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": json.dumps({"code": "invalid_requirements", "message": "pin each package"})}],
+            }
+        }
+
+        SMOKE_MODULE.require_tool_error_code(response, "invalid_requirements", "create_environment")
+
+    def test_rejects_unexpected_structured_api_error_code(self) -> None:
+        response = {
+            "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": json.dumps({"code": "internal_error", "message": "failure"})}],
+            }
+        }
+
+        with self.assertRaisesRegex(SystemExit, "expected invalid_requirements"):
+            SMOKE_MODULE.require_tool_error_code(response, "invalid_requirements", "create_environment")
 
     def test_fixture_json_decoder_rejects_malformed_body(self) -> None:
         self.assertIsNone(SMOKE_MODULE._decode_json_object("application/json", b"{"))
