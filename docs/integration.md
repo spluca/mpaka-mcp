@@ -40,9 +40,15 @@ MPAKA_API_KEY=... python3 scripts/mcp-live-integration.py --execution-only
 ```
 
 The optional `--cli-environment-id` verifies an environment created by another
-client that can create environments. The mPaka CLI version checked on
-2026-11-27 only provides `run`; it has no environment create or select
-command, so it cannot supply this ID.
+client that can create environments. On 2026-11-27, the signed Linux
+`x86_64-unknown-linux-musl` CLI artifact published for `v0.4.1` was downloaded
+from the `latest-v2` channel, matched against its signed manifest, and
+verified with the release signing key. The extracted binary reports version
+`0.4.1` and exposes `environments create`, `environments wait`, and
+`run --environment`. Earlier notes that this release only provided `run`
+describe a different or unidentified binary and should not be used as release
+evidence. Record the exact platform artifact, manifest verification result,
+and binary SHA-256 for each acceptance run.
 
 ```sh
 MPAKA_API_KEY=... python3 scripts/mcp-live-integration.py \
