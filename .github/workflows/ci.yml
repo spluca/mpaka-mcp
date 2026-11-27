@@ -21,6 +21,8 @@ jobs:
           python-version: '3.x'
       - name: Install MCP smoke validator
         run: python -m pip install -r scripts/requirements-mcp-smoke.txt
+      - name: Test live integration runner
+        run: python -m unittest scripts/test_mcp_live_integration.py
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run MCP tests
