@@ -110,7 +110,11 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
         elif path.startswith("/v1/executions/") and _is_uuid_path(path, "/v1/executions/"):
             payload = self._execution(path.removeprefix("/v1/executions/"))
         elif path.startswith("/v1/environments/") and _is_uuid_path(path, "/v1/environments/"):
-            payload = self._environment(path.removeprefix("/v1/environments/"))
+            environment_id = path.removeprefix("/v1/environments/")
+            if environment_id == "00000000-0000-0000-0000-000000000099":
+                self._send_api_error(404, "environment_not_found", "environment does not exist")
+                return
+            payload = self._environment(environment_id)
         else:
             self.send_error(404, "No smoke fixture for this route")
             return
@@ -128,6 +132,9 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             if self.path == "/v1/environments":
+                if self.headers.get("Idempotency-Key") == "smoke-invalid-requirements":
+                    self._send_api_error(400, "invalid_requirements", "pin each package")
+                    return
                 if not _valid_environment_request(payload):
                     self.send_error(400, "Invalid environment request")
                     return
@@ -145,6 +152,14 @@ class SmokeApiHandler(BaseHTTPRequestHandler):
             self._send(self._execution(execution_id))
         else:
             self.send_error(404, "No smoke fixture for this route")
+
+    def _send_api_error(self, status: int, code: str, message: str) -> None:
+        body = json.dumps({"error": {"code": code, "message": message}}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_json_object(self) -> dict | None:
         content_length = self.headers.get("Content-Length", "")
@@ -267,6 +282,23 @@ def require_tool_call_result(response: dict, catalog_response: dict, tool_name: 
     return True
 
 
+def require_tool_error_code(response: dict, expected_code: str, tool_name: str) -> None:
+    result = response.get("result")
+    if not isinstance(result, dict) or result.get("isError") is not True:
+        raise SystemExit(f"MCP tool {tool_name} did not return an MCP tool error")
+    content = result.get("content")
+    text = next(
+        (item.get("text") for item in content if isinstance(item, dict) and item.get("type") == "text"),
+        None,
+    ) if isinstance(content, list) else None
+    try:
+        error = json.loads(text) if isinstance(text, str) else None
+    except json.JSONDecodeError:
+        error = None
+    if not isinstance(error, dict) or error.get("code") != expected_code or not isinstance(error.get("message"), str):
+        raise SystemExit(f"MCP tool {tool_name} did not preserve expected {expected_code} API error code")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: mcp-binary-smoke.py PATH_TO_BINARY")
@@ -306,6 +338,14 @@ def main() -> int:
         {"jsonrpc": "2.0", "id": index + 3, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
         for index, (name, arguments) in enumerate(smoke_calls)
     ]
+    api_error_calls = [
+        ("create_environment", {"requirements": ["requests==2.32.3"], "idempotency_key": "smoke-invalid-requirements"}, "invalid_requirements"),
+        ("get_environment", {"environment_id": "00000000-0000-0000-0000-000000000099"}, "environment_not_found"),
+    ]
+    api_error_requests = [
+        {"jsonrpc": "2.0", "id": len(call_requests) + 3 + offset, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+        for offset, (name, arguments, _) in enumerate(api_error_calls)
+    ]
     env = os.environ.copy()
     api = ThreadingHTTPServer(("127.0.0.1", 0), SmokeApiHandler)
     api_thread = Thread(target=api.serve_forever, daemon=True)
@@ -326,6 +366,7 @@ def main() -> int:
                 + json.dumps(list_tools)
                 + "\n"
                 + "".join(json.dumps(request) + "\n" for request in call_requests)
+                + "".join(json.dumps(request) + "\n" for request in api_error_requests)
             ).encode(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -364,7 +405,13 @@ def main() -> int:
     if successful_calls != len(smoke_calls):
         failed = len(smoke_calls) - successful_calls
         raise SystemExit(f"MCP smoke requires successful results for all {len(smoke_calls)} tool calls; {failed} failed")
-    print(f"MCP stdio initialize, discovery, and tools/call schema smoke passed ({successful_calls} successful calls, {api_errors} API errors)")
+    for offset, (name, _, expected_code) in enumerate(api_error_calls, start=len(smoke_calls) + 3):
+        call_response = next((message for message in messages if message.get("id") == offset), None)
+        if call_response is None:
+            raise SystemExit(f"MCP process did not return a tools/call response for {name}")
+        require_tool_error_code(call_response, expected_code, name)
+        api_errors += 1
+    print(f"MCP stdio initialize, discovery, and tools/call schema smoke passed ({successful_calls} successful calls, {api_errors} structured API errors)")
     return 0
 
 
