@@ -1,10 +1,11 @@
-.PHONY: help fmt test clippy build smoke-test release-test ci
+.PHONY: help fmt test python-test clippy build smoke-test release-test ci
 
 help:
 	@printf '%s\n' \
 		'mPaka MCP development commands:' \
 		'  make fmt          Check Rust formatting' \
 		'  make test         Run tests with nextest' \
+		'  make python-test  Run live integration runner tests' \
 		'  make clippy       Run Clippy with warnings denied' \
 		'  make build        Build the release binary' \
 		'  make smoke-test   Exercise all MCP tools using the built binary' \
@@ -16,6 +17,9 @@ fmt:
 
 test:
 	cargo nextest run --locked
+
+python-test:
+	python3 -m unittest scripts/test_mcp_live_integration.py
 
 clippy:
 	cargo clippy --locked --all-targets -- -D warnings
@@ -29,4 +33,4 @@ smoke-test: build
 release-test:
 	bash scripts/mcp-release-test.sh
 
-ci: fmt test clippy release-test smoke-test
+ci: fmt test python-test clippy release-test smoke-test

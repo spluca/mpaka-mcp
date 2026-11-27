@@ -68,6 +68,8 @@ put them in tool arguments or commit them to configuration files.
 
 See [docs/tools.md](docs/tools.md) for arguments and behavior.
 See [docs/client-setup.md](docs/client-setup.md) for client-specific setup.
+See [docs/integration.md](docs/integration.md) for live checks and
+client-side error handling.
 
 ## Development
 
