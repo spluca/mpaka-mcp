@@ -605,14 +605,14 @@ pub async fn serve_stdio(
 
 #[derive(Debug)]
 struct ApiError {
-    code: &'static str,
+    code: String,
     message: String,
 }
 
 impl ApiError {
     fn input(message: &str) -> Self {
         Self {
-            code: "invalid_input",
+            code: "invalid_input".into(),
             message: message.into(),
         }
     }
@@ -624,28 +624,28 @@ impl ApiError {
             "upstream_unavailable"
         };
         Self {
-            code,
+            code: code.into(),
             message: "mPaka API request failed".into(),
         }
     }
 
     fn response_too_large() -> Self {
         Self {
-            code: "upstream_response_too_large",
+            code: "upstream_response_too_large".into(),
             message: "mPaka API response exceeded the allowed size".into(),
         }
     }
 
     fn invalid_json() -> Self {
         Self {
-            code: "upstream_invalid_response",
+            code: "upstream_invalid_response".into(),
             message: "mPaka API returned an invalid response".into(),
         }
     }
 
     fn wait_timeout() -> Self {
         Self {
-            code: "upstream_timeout",
+            code: "upstream_timeout".into(),
             message: "mPaka API request did not return a resource state before the wait deadline"
                 .into(),
         }
@@ -699,27 +699,20 @@ async fn decode_json_response<T: DeserializeOwned>(
     let api_code = payload
         .as_ref()
         .and_then(|body| body.error.as_ref())
-        .and_then(|error| error.code.as_deref());
-    let code = match (status, api_code) {
-        (StatusCode::UNAUTHORIZED, _) => "unauthorized",
-        (StatusCode::FORBIDDEN, _) => "forbidden",
-        (StatusCode::NOT_FOUND, _) => "not_found",
-        (StatusCode::TOO_MANY_REQUESTS, _) => "rate_limited",
-        (StatusCode::CONFLICT, _) => "conflict",
-        (
-            _,
-            Some(
-                "daily_budget_exceeded"
-                | "execution_limit_exceeded"
-                | "tenant_execution_limit_exceeded"
-                | "tenant_cpu_limit_exceeded"
-                | "concurrency_quota_exceeded"
-                | "resource_quota_exceeded",
-            ),
-        ) => "quota_exceeded",
-        (StatusCode::BAD_REQUEST, _) => "invalid_input",
-        _ => "upstream_unavailable",
-    };
+        .and_then(|error| error.code.as_deref())
+        .filter(|code| !code.trim().is_empty());
+    let code = api_code.map(str::to_owned).unwrap_or_else(|| {
+        match status {
+            StatusCode::UNAUTHORIZED => "unauthorized",
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+            StatusCode::CONFLICT => "conflict",
+            StatusCode::BAD_REQUEST => "invalid_input",
+            _ => "upstream_unavailable",
+        }
+        .to_owned()
+    });
     let message = payload
         .and_then(|body| body.error)
         .and_then(|error| error.message)
@@ -779,6 +772,100 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn checked_in_openapi_covers_mcp_routes_states_and_errors() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../contracts/openapi.json"))
+                .expect("OpenAPI fixture");
+        let paths = &contract["paths"];
+        let schemas = &contract["components"]["schemas"];
+
+        assert_eq!(
+            paths["/v1/environments"]["post"]["operationId"],
+            "create_python_environment"
+        );
+        assert_eq!(
+            paths["/v1/environments/{id}"]["get"]["operationId"],
+            "get_python_environment"
+        );
+        assert_eq!(
+            paths["/v1/executions"]["post"]["operationId"],
+            "create_execution"
+        );
+        for (path, method, status) in [
+            ("/v1/environments", "post", "202"),
+            ("/v1/environments", "post", "400"),
+            ("/v1/environments", "post", "503"),
+            ("/v1/environments/{id}", "get", "404"),
+            ("/v1/environments/{id}", "get", "503"),
+            ("/v1/executions", "post", "404"),
+            ("/v1/executions", "post", "409"),
+        ] {
+            assert!(
+                paths[path][method]["responses"].get(status).is_some(),
+                "OpenAPI fixture is missing {status} for {method} {path}"
+            );
+        }
+        for state in ["queued", "building", "ready", "failed"] {
+            assert!(
+                schemas["EnvironmentStatusSchema"]["enum"]
+                    .as_array()
+                    .expect("environment status enum")
+                    .contains(&serde_json::Value::String(state.into()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn environment_api_errors_preserve_openapi_error_codes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock API");
+        let address = listener.local_addr().expect("mock API address");
+        let app = Router::new()
+            .route(
+                "/v1/environments",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error":{"code":"invalid_requirements","message":"pin each package"}})),
+                    )
+                }),
+            )
+            .route(
+                "/v1/environments/{id}",
+                get(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error":{"code":"environment_not_found","message":"not found"}})),
+                    )
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock API");
+        });
+        let config = McpConfig::new(
+            Url::parse(&format!("http://{address}")).expect("mock API URL"),
+            "tenant-key-for-test".into(),
+            Duration::from_secs(5),
+        )
+        .expect("valid MCP config");
+        let client = ApiClient::new(config).expect("API client");
+
+        let create_error = client
+            .create_environment(vec!["requests==2.32.3".into()], "env-invalid-1".into())
+            .await
+            .expect_err("API rejects invalid package");
+        let get_error = client
+            .get_environment(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap())
+            .await
+            .expect_err("API cannot find environment");
+        task.abort();
+
+        assert_eq!(create_error.code, "invalid_requirements");
+        assert_eq!(get_error.code, "environment_not_found");
+    }
 
     #[derive(Clone, Default)]
     struct CapturedRequest(Arc<Mutex<Option<(HeaderMap, serde_json::Value)>>>);
@@ -1778,7 +1865,7 @@ mod tests {
                 Some(15_000),
                 Some("custom_memory".into()),
                 Some("custom_cpu".into()),
-                None,
+                Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()),
             )
             .await
             .expect("execution accepted");
@@ -1797,6 +1884,10 @@ mod tests {
         assert_eq!(body["memory_profile"], "custom_memory");
         assert_eq!(body["cpu_profile"], "custom_cpu");
         assert_eq!(body["timeout_ms"], 15_000);
+        assert_eq!(
+            body["environment_id"],
+            "00000000-0000-0000-0000-000000000002"
+        );
         assert_eq!(
             execution.id,
             Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
